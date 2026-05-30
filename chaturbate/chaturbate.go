@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"sort"
 	"strconv"
@@ -669,12 +670,24 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 	initWritten := false
 	consecutiveErrors := 0
 
-	// Per-track tfdt base times captured from the first segment of each track.
-	// Subtracting these normalises timestamps to start from zero.
+	// Per-track tfdt base times and timescales captured from init/first segments.
+	// videoShift/audioShift are the synchronized shifts computed once both bases
+	// are known; they align both tracks to the same real-time presentation origin.
+	var videoTimescale, audioTimescale uint64
 	var videoTimeBase uint64
 	var audioTimeBase uint64
 	videoBaseSet := false
 	audioBaseSet := false
+	var syncBaseComputed bool
+	var videoShift, audioShift uint64
+
+	// pendingChunk buffers raw (unshifted) segment bytes before sync is computed.
+	type pendingChunk struct {
+		rawVideo []byte
+		rawAudio []byte
+		duration float64
+	}
+	var pendingChunks []pendingChunk
 
 	for {
 		// Fetch video playlist
@@ -742,6 +755,16 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 				videoInitBytes = b
 				lastVideoMapURI = v.Map.URI
 				initWritten = false
+				syncBaseComputed = false // re-sync after init change
+				videoBaseSet = false
+				audioBaseSet = false
+				pendingChunks = nil
+				if ts, ok := extractTimescaleFromInit(b); ok {
+					videoTimescale = ts
+					fmt.Printf("[sync] muxed: video init timescale=%d\n", ts)
+				} else {
+					fmt.Printf("[sync] muxed: video init timescale=unknown (parse failed)\n")
+				}
 			}
 			break
 		}
@@ -760,6 +783,12 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 				audioInitBytes = b
 				lastAudioMapURI = v.Map.URI
 				initWritten = false
+				if ts, ok := extractTimescaleFromInit(b); ok {
+					audioTimescale = ts
+					fmt.Printf("[sync] muxed: audio init timescale=%d\n", ts)
+				} else {
+					fmt.Printf("[sync] muxed: audio init timescale=unknown (parse failed)\n")
+				}
 			}
 			break
 		}
@@ -852,14 +881,46 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			if len(newAudioSegs) > maxLen {
 				maxLen = len(newAudioSegs)
 			}
+
+			// computeSyncShifts sets videoShift/audioShift to a common presentation
+			// origin derived from real-time seconds so both tracks stay in sync.
+			computeSyncShifts := func() {
+				if videoTimescale > 0 && audioTimescale > 0 {
+					videoStart := float64(videoTimeBase) / float64(videoTimescale)
+					audioStart := float64(audioTimeBase) / float64(audioTimescale)
+					minStart := videoStart
+					if audioStart < minStart {
+						minStart = audioStart
+					}
+					videoShift = videoTimeBase - uint64(math.Round(minStart*float64(videoTimescale)))
+					audioShift = audioTimeBase - uint64(math.Round(minStart*float64(audioTimescale)))
+					fmt.Printf("[sync] muxed: video tfdt=%d ts=%d (%.6fs)  audio tfdt=%d ts=%d (%.6fs)  minStart=%.6fs  videoShift=%d audioShift=%d drift=%.3fms\n",
+						videoTimeBase, videoTimescale, videoStart,
+						audioTimeBase, audioTimescale, audioStart,
+						minStart, videoShift, audioShift,
+						(videoStart-audioStart)*1000,
+					)
+				} else {
+					videoShift = videoTimeBase
+					audioShift = audioTimeBase
+					fmt.Printf("[sync] muxed: timescales unknown, using raw bases videoShift=%d audioShift=%d\n", videoShift, audioShift)
+				}
+				syncBaseComputed = true
+				fmt.Printf("[sync] muxed: flushing %d buffered segment(s)\n", len(pendingChunks))
+				// pendingChunks are flushed by the caller after this returns.
+			}
+
 			for i := 0; i < maxLen; i++ {
-				var chunk []byte
-				var chunkDuration float64
+				// Collect raw bytes without shifting so the synchronized shift
+				// can be applied once both track bases are known.
+				var rawVideo []byte
+				var videoDur float64
+				var rawAudio []byte
 
 				if i < len(newVideoSegs) {
 					vseg := newVideoSegs[i]
 					vsegURL := vseg.url
-					segBytes, err := retry.DoWithData(
+					b, err := retry.DoWithData(
 						func() ([]byte, error) { return client.GetBytes(ctx, vsegURL) },
 						retry.Context(ctx),
 						retry.Attempts(3),
@@ -867,21 +928,21 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 						retry.DelayType(retry.FixedDelay),
 					)
 					if err == nil {
+						rawVideo = b
+						videoDur = vseg.duration
 						if !videoBaseSet {
-							if t, ok := extractMoofFirstTfdt(segBytes); ok {
+							if t, ok := extractMoofFirstTfdt(b); ok {
 								videoTimeBase = t
 								videoBaseSet = true
+								fmt.Printf("[sync] muxed: video first tfdt=%d\n", t)
 							}
 						}
-						segBytes = shiftSegmentTfdt(segBytes, 1, videoTimeBase)
-						chunk = append(chunk, segBytes...)
-						chunkDuration = vseg.duration
 					}
 				}
 				if i < len(newAudioSegs) {
 					aseg := newAudioSegs[i]
 					asegURL := aseg.url
-					segBytes, err := retry.DoWithData(
+					b, err := retry.DoWithData(
 						func() ([]byte, error) { return client.GetBytes(ctx, asegURL) },
 						retry.Context(ctx),
 						retry.Attempts(3),
@@ -891,31 +952,60 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 					if err != nil {
 						fmt.Printf("[WARN] audio seg download failed: %v\n", err)
 					} else {
+						rawAudio = b
 						if !audioBaseSet {
-							if t, ok := extractMoofFirstTfdt(segBytes); ok {
+							if t, ok := extractMoofFirstTfdt(b); ok {
 								audioTimeBase = t
 								audioBaseSet = true
-								if server.Config.Debug {
-									fmt.Printf("[DEBUG] muxed: audio base=%d\n", audioTimeBase)
-								}
+								fmt.Printf("[sync] muxed: audio first tfdt=%d\n", t)
 							}
 						}
-						if server.Config.Debug {
-							if rawTfdt, ok := extractMoofFirstTfdt(segBytes); ok {
-								var normalised uint64
-								if audioTimeBase > 0 && rawTfdt >= audioTimeBase {
-									normalised = rawTfdt - audioTimeBase
-								}
-								fmt.Printf("[DEBUG] muxed: audio seg dur=%.3f raw_tfdt=%d norm=%d\n", aseg.duration, rawTfdt, normalised)
-							}
-						}
-						segBytes = rewriteAudioMoofTrackID(segBytes)
-						segBytes = shiftSegmentTfdt(segBytes, 2, audioTimeBase)
-						chunk = append(chunk, segBytes...)
 					}
 				}
+
+				// Compute synchronized shifts once both track bases are known.
+				if !syncBaseComputed && videoBaseSet && audioBaseSet {
+					computeSyncShifts()
+					// Flush segments buffered before sync was computed.
+					for _, pc := range pendingChunks {
+						var chunk []byte
+						if pc.rawVideo != nil {
+							chunk = append(chunk, shiftSegmentTfdt(pc.rawVideo, 1, videoShift)...)
+						}
+						if pc.rawAudio != nil {
+							a := rewriteAudioMoofTrackID(pc.rawAudio)
+							a = shiftSegmentTfdt(a, 2, audioShift)
+							chunk = append(chunk, a...)
+						}
+						if len(chunk) > 0 {
+							if err := handler(chunk, pc.duration); err != nil {
+								return fmt.Errorf("handler buffered muxed segment: %w", err)
+							}
+						}
+					}
+					pendingChunks = nil
+				}
+
+				if rawVideo == nil && rawAudio == nil {
+					continue
+				}
+				if !syncBaseComputed {
+					// Buffer until both track bases are available.
+					pendingChunks = append(pendingChunks, pendingChunk{rawVideo: rawVideo, rawAudio: rawAudio, duration: videoDur})
+					continue
+				}
+
+				var chunk []byte
+				if rawVideo != nil {
+					chunk = append(chunk, shiftSegmentTfdt(rawVideo, 1, videoShift)...)
+				}
+				if rawAudio != nil {
+					a := rewriteAudioMoofTrackID(rawAudio)
+					a = shiftSegmentTfdt(a, 2, audioShift)
+					chunk = append(chunk, a...)
+				}
 				if len(chunk) > 0 {
-					if err := handler(chunk, chunkDuration); err != nil {
+					if err := handler(chunk, videoDur); err != nil {
 						return fmt.Errorf("handler muxed segment group: %w", err)
 					}
 				}
@@ -947,21 +1037,15 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 				fmt.Printf("[WARN] video seg download failed: %v\n", err)
 				continue
 			}
-
 			rawTfdt, ok := extractMoofFirstTfdt(segBytes)
 			if !videoBaseSet && ok {
 				videoTimeBase = rawTfdt
 				videoBaseSet = true
+				fmt.Printf("[sync] stripchat: video first tfdt=%d\n", rawTfdt)
 			}
-
-			normalisedTime := rawTfdt
-			if videoBaseSet && rawTfdt >= videoTimeBase {
-				normalisedTime = rawTfdt - videoTimeBase
-			}
-			segBytes = shiftSegmentTfdt(segBytes, 1, videoTimeBase)
 			pending = append(pending, pendingSeg{
 				track:    "video",
-				time:     normalisedTime,
+				time:     rawTfdt,
 				duration: vseg.duration,
 				data:     segBytes,
 			})
@@ -980,32 +1064,63 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 				fmt.Printf("[WARN] audio seg download failed: %v\n", err)
 				continue
 			}
-
 			rawTfdt, ok := extractMoofFirstTfdt(segBytes)
 			if !audioBaseSet && ok {
 				audioTimeBase = rawTfdt
 				audioBaseSet = true
-				if server.Config.Debug {
-					fmt.Printf("[DEBUG] muxed: audio base=%d\n", audioTimeBase)
-				}
+				fmt.Printf("[sync] stripchat: audio first tfdt=%d\n", rawTfdt)
 			}
-
-			normalisedTime := rawTfdt
-			if audioBaseSet && rawTfdt >= audioTimeBase {
-				normalisedTime = rawTfdt - audioTimeBase
-			}
-			if server.Config.Debug && ok {
-				fmt.Printf("[DEBUG] muxed: audio seg dur=%.3f raw_tfdt=%d norm=%d\n", aseg.duration, rawTfdt, normalisedTime)
-			}
-
 			segBytes = rewriteAudioMoofTrackID(segBytes)
-			segBytes = shiftSegmentTfdt(segBytes, 2, audioTimeBase)
 			pending = append(pending, pendingSeg{
 				track:    "audio",
-				time:     normalisedTime,
+				time:     rawTfdt,
 				duration: 0,
 				data:     segBytes,
 			})
+		}
+
+		// Compute synchronized shifts once both bases are known.
+		if !syncBaseComputed && videoBaseSet && audioBaseSet {
+			if videoTimescale > 0 && audioTimescale > 0 {
+				videoStart := float64(videoTimeBase) / float64(videoTimescale)
+				audioStart := float64(audioTimeBase) / float64(audioTimescale)
+				minStart := videoStart
+				if audioStart < minStart {
+					minStart = audioStart
+				}
+				videoShift = videoTimeBase - uint64(math.Round(minStart*float64(videoTimescale)))
+				audioShift = audioTimeBase - uint64(math.Round(minStart*float64(audioTimescale)))
+				fmt.Printf("[sync] stripchat: video tfdt=%d ts=%d (%.6fs)  audio tfdt=%d ts=%d (%.6fs)  minStart=%.6fs  videoShift=%d audioShift=%d drift=%.3fms\n",
+					videoTimeBase, videoTimescale, videoStart,
+					audioTimeBase, audioTimescale, audioStart,
+					minStart, videoShift, audioShift,
+					(videoStart-audioStart)*1000,
+				)
+			} else {
+				videoShift = videoTimeBase
+				audioShift = audioTimeBase
+				fmt.Printf("[sync] stripchat: timescales unknown, using raw bases videoShift=%d audioShift=%d\n", videoShift, audioShift)
+			}
+			syncBaseComputed = true
+		}
+
+		// Apply synchronized shifts and sort by adjusted presentation time.
+		for i := range pending {
+			if pending[i].track == "video" {
+				normTime := pending[i].time
+				if syncBaseComputed && normTime >= videoShift {
+					normTime -= videoShift
+				}
+				pending[i].time = normTime
+				pending[i].data = shiftSegmentTfdt(pending[i].data, 1, videoShift)
+			} else {
+				normTime := pending[i].time
+				if syncBaseComputed && normTime >= audioShift {
+					normTime -= audioShift
+				}
+				pending[i].time = normTime
+				pending[i].data = shiftSegmentTfdt(pending[i].data, 2, audioShift)
+			}
 		}
 
 		sort.SliceStable(pending, func(i, j int) bool {

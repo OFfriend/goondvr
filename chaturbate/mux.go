@@ -586,6 +586,46 @@ func normaliseTfdt(data []byte, minTimes map[uint32]uint64) {
 	}
 }
 
+// extractTimescaleFromInit returns the timescale for the first track found in an
+// fMP4 init segment (moov > trak > mdia > mdhd.timescale). Returns 0, false on
+// any parse failure.
+func extractTimescaleFromInit(data []byte) (uint64, bool) {
+	moovBox, ok := findMP4Box(data, "moov")
+	if !ok {
+		return 0, false
+	}
+	trakBox, ok := findMP4Box(moovBox[8:], "trak")
+	if !ok {
+		return 0, false
+	}
+	mdiaBox, ok := findMP4Box(trakBox[8:], "mdia")
+	if !ok {
+		return 0, false
+	}
+	mdhdBox, ok := findMP4Box(mdiaBox[8:], "mdhd")
+	if !ok {
+		return 0, false
+	}
+	// mdhd layout (full box including 8-byte size+type header):
+	//   [8]      version
+	//   [9:12]   flags
+	//   version 0: [12:16] creation, [16:20] modification, [20:24] timescale
+	//   version 1: [12:20] creation, [20:28] modification, [28:32] timescale
+	if len(mdhdBox) < 9 {
+		return 0, false
+	}
+	version := mdhdBox[8]
+	if version == 0 && len(mdhdBox) >= 24 {
+		ts := uint64(binary.BigEndian.Uint32(mdhdBox[20:]))
+		return ts, ts > 0
+	}
+	if version == 1 && len(mdhdBox) >= 32 {
+		ts := uint64(binary.BigEndian.Uint32(mdhdBox[28:]))
+		return ts, ts > 0
+	}
+	return 0, false
+}
+
 // extractMoofFirstTfdt returns the baseMediaDecodeTime from the first moof found
 // in data (a raw fMP4 segment). Returns (0, false) if not found.
 func extractMoofFirstTfdt(data []byte) (uint64, bool) {
